@@ -69,6 +69,17 @@ service / on consentListener {
 
         string[] scopes = extractScopesFromContext(consentContext);
         string user = extractUserFromContext(consentContext);
+        string mandatoryClaims = extractMandatoryClaimsFromContext(consentContext);
+
+        if scopes.length() == 0 && consentContextApiBaseUrl != "" {
+            string redirectUrl = consentContextApiBaseUrl +
+                "/authenticationendpoint/oauth2_consent.do?sessionDataKeyConsent=" +
+                getEncodedUri(sessionDataKeyConsent);
+            http:Response skipResponse = new;
+            skipResponse.statusCode = 302;
+            skipResponse.setHeader("Location", redirectUrl);
+            return skipResponse;
+        }
 
         string|error html = io:fileReadString(uiDistPath + "/index.html");
         if html is error {
@@ -81,6 +92,8 @@ service / on consentListener {
             spId,
             user,
             scopes,
+            mandatoryClaims,
+            consentAuthorizeRedirectUrl: consentAuthorizeRedirectUrl,
             contextJson: consentContext.toJsonString()
         };
         string consentPropsJson = escapeForScriptTag(consentProps.toJsonString());
@@ -148,83 +161,44 @@ service / on consentListener {
         check caller->respond(response);
     }
 
-    resource function post consent(http:Request req) returns http:Response {
-        string|error payload = req.getTextPayload();
-        if payload is error {
-            return buildTextResponse(400, "Invalid form payload");
+    resource function post store\-scopes(http:Request req) returns http:Response {
+        json|error jsonPayload = req.getJsonPayload();
+        if jsonPayload is error {
+            return buildTextResponse(400, "Invalid JSON payload");
         }
 
-        map<string[]> form = parseFormUrlEncoded(payload);
-        string sessionDataKeyConsent = getFirstValue(form, "SessionDataKeyConsent") ?: "";
-        string consent = getFirstValue(form, "Consent") ?: "approve";
-        string hasApprovedAlways = getFirstValue(form, "hasApprovedAlways") ?: "false";
-        string userClaimsConsent = getFirstValue(form, "User_claims_consent") ?: "true";
-        string user = getFirstValue(form, "user") ?: "";
-        string spId = getFirstValue(form, "spId") ?: "";
-        string[] selectedScopes = form["scope"] ?: [];
-
-        if consentAuthorizeRedirectUrl == "" {
-            json result = {
-                SessionDataKeyConsent: sessionDataKeyConsent,
-                Consent: consent,
-                hasApprovedAlways: hasApprovedAlways,
-                User_claims_consent: userClaimsConsent,
-                user: user,
-                spId: spId,
-                scopes: selectedScopes
-            };
-            http:Response response = new;
-            response.setHeader("Content-Type", "application/json");
-            response.setPayload(result);
-            return response;
+        json|error sessionDataKeyConsentVal = jsonPayload.sessionDataKeyConsent;
+        if sessionDataKeyConsentVal is error || sessionDataKeyConsentVal is () || sessionDataKeyConsentVal is json[] {
+            return buildTextResponse(400, "Missing or invalid sessionDataKeyConsent in payload");
         }
-
-        if consent != "deny" {
-            log:printDebug("Storing approved scopes for consent", sessionDataKeyConsent = sessionDataKeyConsent, 
-                scopeCount = selectedScopes.length());
-            error? storeErr = storeApprovedScopesByConsentKey(sessionDataKeyConsent, selectedScopes);
-            if storeErr is error {
-                log:printError("Failed to persist approved scopes", 'error = storeErr,
-                    sessionDataKeyConsent = sessionDataKeyConsent);
-                return buildTextResponse(500, "Failed to store approved scopes");
+        string sessionDataKeyConsent = sessionDataKeyConsentVal.toString();
+        json|error scopesJson = jsonPayload.scopes;
+        string[] selectedScopes = [];
+        if scopesJson is json[] {
+            foreach json s in scopesJson {
+                if s is string && s != "" {
+                    selectedScopes.push(s);
+                }
             }
         }
 
-        string cookieHeader = "";
-        string|http:HeaderNotFoundError cookieVal = req.getHeader("Cookie");
-        if cookieVal is string {
-            cookieHeader = cookieVal;
-        }
-        if cookieHeader == "" {
-            return buildTextResponse(400, "Missing session cookies. Ensure consent page is loaded over HTTPS.");
+        if sessionDataKeyConsent == "" {
+            return buildTextResponse(400, "Missing sessionDataKeyConsent");
         }
 
-        boolean hasJSessionId = cookieHeader.indexOf("JSESSIONID=") is int;
-        boolean hasOpbs = cookieHeader.indexOf("opbs=") is int;
-        boolean hasCommonAuthId = cookieHeader.indexOf("commonAuthId=") is int;
-        if !hasJSessionId && !hasOpbs && !hasCommonAuthId {
-            return buildTextResponse(400,
-                "No recognizable IS session cookie found (expected one of JSESSIONID/opbs/commonAuthId).");
-        }
-        if !hasJSessionId || !hasOpbs {
-            log:printWarn("Some IS session cookies are missing in browser request; continuing with available cookies",
-                hasJSessionId = hasJSessionId, hasOpbs = hasOpbs, hasCommonAuthId = hasCommonAuthId);
-        }
-        if consent != "deny" && user == "" {
-            return buildTextResponse(400, "Missing authenticated user in consent context.");
+        log:printDebug("Storing approved scopes", sessionDataKeyConsent = sessionDataKeyConsent,
+            scopeCount = selectedScopes.length());
+        error? storeErr = storeApprovedScopesByConsentKey(sessionDataKeyConsent, selectedScopes);
+        if storeErr is error {
+            log:printError("Failed to persist approved scopes", 'error = storeErr,
+                sessionDataKeyConsent = sessionDataKeyConsent);
+            return buildTextResponse(500, "Failed to store approved scopes");
         }
 
-        string|error locationUri = postAuthorizeRequest(sessionDataKeyConsent, consent, hasApprovedAlways,
-            user, spId, selectedScopes, cookieHeader);
-        if locationUri is error {
-            log:printError("Authorize POST failed", 'error = locationUri);
-            return buildTextResponse(502, "Authorize request failed: " + locationUri.message());
-        }
-
-        http:Response redirect = new;
-        redirect.statusCode = 302;
-        redirect.setHeader("Location", locationUri);
-        return redirect;
+        http:Response response = new;
+        response.setHeader("Content-Type", "application/json");
+        response.setPayload({status: "ok"});
+        return response;
     }
 }
 
@@ -257,53 +231,6 @@ function fetchConsentContext(string sessionDataKeyConsent) returns json|error {
         return error(string `Context API returned status ${response.statusCode}: ${body}`);
     }
     return check response.getJsonPayload();
-}
-
-function postAuthorizeRequest(string sessionDataKeyConsent, string consent, string hasApprovedAlways,
-    string user, string spId, string[] selectedScopes, string cookieHeader) returns string|error {
-
-    http:ClientConfiguration clientConfig = {followRedirects: {enabled: false}};
-    if consentAuthorizeRedirectUrl.startsWith("https://") &&
-            consentContextApiTrustStorePath != "" && consentContextApiTrustStorePassword != "" {
-        clientConfig.secureSocket = {
-            cert: {
-                path: consentContextApiTrustStorePath,
-                password: consentContextApiTrustStorePassword
-            }
-        };
-    }
-
-    http:Client authorizeClient = check new (consentAuthorizeRedirectUrl, clientConfig);
-
-    string body = string `sessionDataKeyConsent=${getEncodedUri(sessionDataKeyConsent)}` +
-        string `&consent=${getEncodedUri(consent)}` +
-        string `&hasApprovedAlways=${getEncodedUri(hasApprovedAlways)}` +
-        string `&consent_custom_attribute="customAttr"` +
-        string `&user=${getEncodedUri(user)}`;
-
-    if selectedScopes.length() > 0 {
-        body += string `&scope=${getEncodedUri(string:'join(" ", ...selectedScopes))}`;
-    }
-
-    http:Request authorizeReq = new;
-    authorizeReq.setHeader("Content-Type", "application/x-www-form-urlencoded");
-    authorizeReq.setHeader("Cookie", cookieHeader);
-    authorizeReq.setPayload(body);
-
-    http:Response authorizeResp = check authorizeClient->post("", authorizeReq);
-
-    if authorizeResp.statusCode == 301 || authorizeResp.statusCode == 302 ||
-            authorizeResp.statusCode == 303 || authorizeResp.statusCode == 307 ||
-            authorizeResp.statusCode == 308 {
-        return check authorizeResp.getHeader("Location");
-    }
-
-    string respBody = "";
-    string|error maybeBody = authorizeResp.getTextPayload();
-    if maybeBody is string { respBody = maybeBody; }
-    return error(respBody == "" ?
-        string `Authorize endpoint returned ${authorizeResp.statusCode} with empty body` :
-        string `Authorize endpoint returned ${authorizeResp.statusCode}: ${respBody}`);
 }
 
 function initConsentScopeStore() returns error? {
@@ -367,6 +294,10 @@ function extractScopesFromContext(json context) returns string[] {
         addUniqueScope(collected, launchScope);
     }
     return collected;
+}
+
+function extractMandatoryClaimsFromContext(json context) returns string {
+    return findStringByKeyCandidates(context, ["mandatoryClaims"]) ?: "";
 }
 
 function extractLaunchScopeFromSpQueryParams(json context) returns string {
@@ -508,3 +439,4 @@ function buildTextResponse(int statusCode, string message) returns http:Response
     res.setPayload(message);
     return res;
 }
+
